@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Lifeline — 911 AI Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Set your backend here or via ?api= query param -->
+  <meta name="api-base" content="http://127.0.0.1:8000" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1><span class="dot"></span> Lifeline — 911 AI Dashboard</h1>
+    <div class="sub" id="apiLabel"></div>
+  </header>
+
+  <main>
+    <div id="error" class="banner" style="display:none"></div>
+
+    <div class="toolbar">
+      <input id="q" type="text" placeholder="Search summary, location, or type…" />
+      <select id="type">
+        <option value="all">All types</option>
+        <option value="fire">Fire</option>
+        <option value="medical">Medical</option>
+        <option value="crime">Crime</option>
+        <option value="traffic">Traffic</option>
+        <option value="other">Other</option>
+      </select>
+      <label class="chk"><input type="checkbox" id="onlyHigh" /> Only high severity</label>
+      <button class="btn ghost" id="refreshBtn">Refresh</button>
+      <button class="btn primary" id="sampleBtn">Add sample incident</button>
+      <span id="loading" class="sub" style="display:none">Loading…</span>
+    </div>
+
+    <div id="list" class="grid"></div>
+    <div id="empty" class="empty" style="display:none">No incidents yet. Add a sample or connect your phone flow.</div>
+
+    <footer>© Lifeline. Black on white with red accents.</footer>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
