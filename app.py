@@ -1,62 +1,78 @@
 # app.py
+# Lifeline – FastAPI backend with Twilio voice flow and Bedrock (mockable)
+
 import os, json, re
-from typing import List, Dict
+from datetime import datetime
+from typing import List, Dict, Optional
+
 from fastapi import FastAPI, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
+
 import boto3
 
-# ------------- Config -------------
+# ---------------- Config ----------------
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 BEDROCK_MODEL = os.getenv("BEDROCK_MODEL", "anthropic.claude-3-haiku-20240307-v1:0")
+MOCK_BEDROCK = os.getenv("MOCK_BEDROCK", "0") == "1"   # set to "1" to demo w/o AWS creds
 
-# If you haven't finished AWS activation yet and want to demo quickly,
-# set MOCK_BEDROCK=1 in your env to bypass Bedrock and return a fake summary.
-MOCK_BEDROCK = os.getenv("MOCK_BEDROCK", "0") == "1"
-
-# ------------- Clients -------------
+# Only create Bedrock client when not mocking
+bedrock = None
 if not MOCK_BEDROCK:
     bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 
-# ------------- App + CORS -------------
-app = FastAPI(title="Lifeline API", version="1.0")
+# ---------------- App + CORS -------------
+app = FastAPI(title="Lifeline API", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict to your Lovable app domain in production
+    allow_origins=["*"],      # tighten to your frontend domain when deployed
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------- In-memory store (demo) -------------
-INCIDENTS: List[Dict] = []
+# ---------------- In-memory stores -------
+INCIDENTS: List[Dict] = []            # dashboard data
+CALLS: Dict[str, Dict] = {}           # active Twilio call sessions (CallSid -> state)
 
 
-# ------------- Bedrock helper -------------
+# ---------------- Utilities --------------
+def _extract_int_from_speech(s: str, default: int = 1) -> int:
+    s = (s or "").lower()
+    m = re.search(r"\b(\d+)\b", s)
+    if m:
+        return int(m.group(1))
+    words = {
+        "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+        "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    for w, n in words.items():
+        if w in s:
+            return n
+    return default
+
+
 def summarize_with_bedrock(transcript: str) -> Dict:
     """
-    Sends the transcript to Claude 3 Haiku on Bedrock and parses strict JSON back.
-    If MOCK_BEDROCK=1, returns a deterministic mock response for demo.
+    Send transcript to Claude 3 Haiku on Bedrock and parse strict JSON.
+    If MOCK_BEDROCK=1, return a heuristic mock (no AWS required).
     """
     if MOCK_BEDROCK:
-        # Very simple heuristic to keep your demo unblocked
         t = transcript.lower()
         etype = "other"
-        if any(w in t for w in ["fire", "smoke", "burn"]):
-            etype = "fire"
-        elif any(w in t for w in ["hurt", "injur", "bleed", "ambulance", "medical"]):
-            etype = "medical"
-        elif any(w in t for w in ["robbery", "theft", "gun", "assault", "crime"]):
-            etype = "crime"
-        elif any(w in t for w in ["crash", "accident", "car", "highway", "traffic"]):
-            etype = "traffic"
+        if any(k in t for k in ["fire", "smoke", "burn"]): etype = "fire"
+        elif any(k in t for k in ["crash", "accident", "car", "highway", "traffic"]): etype = "traffic"
+        elif any(k in t for k in ["robbery", "theft", "gun", "assault"]): etype = "crime"
+        elif any(k in t for k in ["hurt", "injur", "bleed", "ambulance", "medical"]): etype = "medical"
 
         return {
             "emergency_type": etype,
             "location": "unknown",
-            "people_involved": 1,
-            "severity": "high" if "fire" in t or "gun" in t else "medium",
-            "summary": transcript[:120]
+            "people_involved": _extract_int_from_speech(t, 1),
+            "severity": "high" if any(k in t for k in ["fire", "gun", "bleeding", "unconscious", "not breathing"]) else "medium",
+            "summary": (transcript[:180] + "...") if len(transcript) > 180 else transcript,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
     prompt = f"""
@@ -78,79 +94,144 @@ Return STRICT JSON only:
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 300,
         "temperature": 0,
-        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+        "messages": [{"role":"user","content":[{"type":"text","text":prompt}]}],
     }
-    resp = bedrock.invoke_model(modelId=BEDROCK_MODEL, body=json.dumps(body))
+    resp = bedrock.invoke_model(modelId=BEDROCK_MODEL, body=json.dumps(body))  # type: ignore[arg-type]
     payload = json.loads(resp["body"].read())
     text = payload["content"][0]["text"]
 
-    # Extract the JSON block safely
     m = re.search(r"\{.*\}", text, flags=re.S)
     if not m:
-        # Fallback to a minimal shape if model didn't return strict JSON
         return {
             "emergency_type": "other",
             "location": "unknown",
             "people_involved": 0,
             "severity": "medium",
-            "summary": text.strip()[:200]
+            "summary": text.strip()[:200],
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
-    return json.loads(m.group(0))
+    data = json.loads(m.group(0))
+    data.setdefault("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    return data
 
 
-# ------------- API for your Lovable frontend -------------
-@app.get("/incidents")
-def list_incidents():
-    """Return newest-first incidents for the dashboard."""
-    return list(reversed(INCIDENTS))
-
-
+# -------------- REST: dashboard ----------
 class AnalyzeReq(BaseModel):
     transcript: str
 
+@app.get("/health")
+def health(): return {"ok": True, "mode": "mock" if MOCK_BEDROCK else "bedrock"}
+
+@app.get("/incidents")
+def list_incidents(): return list(reversed(INCIDENTS))  # newest first
 
 @app.post("/analyze")
 def analyze(req: AnalyzeReq):
-    """Directly analyze free-text (useful for testing without calls)."""
-    result = summarize_with_bedrock(req.transcript)
-    result["id"] = len(INCIDENTS) + 1
-    INCIDENTS.append(result)
-    return result
+    res = summarize_with_bedrock(req.transcript)
+    res["id"] = len(INCIDENTS) + 1
+    INCIDENTS.append(res)
+    return res
 
 
-# ------------- Twilio Voice webhooks (phone flow) -------------
-# IMPORTANT: You must install twilio (`pip install twilio`) and set your Twilio number's webhook.
-
-@app.post("/voice")
+# -------------- Twilio Voice flow --------
+@app.post("/voice", response_class=PlainTextResponse)
 def voice_entry():
     """
-    Initial Twilio webhook. Plays a prompt and gathers speech.
-    Configure your Twilio phone number Voice webhook to POST here.
+    First webhook from Twilio. Starts scripted multi-turn collection.
     """
     from twilio.twiml.voice_response import VoiceResponse, Gather
     vr = VoiceResponse()
-    vr.say("This is Lifeline. Please describe your emergency after the tone.")
-    g = Gather(input="speech", action="/handoff", method="POST", timeout=6)
+    g = Gather(input="speech", action="/gather", method="POST", timeout=7)
+    g.say("This is Lifeline. I will collect details to help dispatch responders.")
+    g.say("First, what is the address or nearest cross street?")
     vr.append(g)
-    # If silence or no speech detected, reprompt:
-    vr.redirect("/voice")
+    # If silence, re-ask:
+    vr.redirect("/voice", method="POST")
     return str(vr)
 
+@app.post("/gather", response_class=PlainTextResponse)
+async def gather(
+    request: Request,
+    CallSid: str = Form(...),
+    SpeechResult: Optional[str] = Form(None),
+):
+    """
+    Handles each Gather response and advances the script.
+    """
+    from twilio.twiml.voice_response import VoiceResponse, Gather
 
-@app.post("/handoff")
-async def handoff(request: Request, SpeechResult: str = Form(None)):
-    """
-    Twilio posts back recognized speech text to this endpoint.
-    We call Bedrock, store the incident, and end the call.
-    """
-    transcript = SpeechResult or ""
-    if transcript.strip():
+    sess = CALLS.get(CallSid) or {"step": 0, "answers": {}, "transcript": []}
+    CALLS[CallSid] = sess
+
+    text = (SpeechResult or "").strip()
+    if text:
+        sess["transcript"].append(text)
+
+    vr = VoiceResponse()
+
+    # Step 0: location
+    if sess["step"] == 0:
+        if text:
+            sess["answers"]["location"] = text
+            sess["step"] = 1
+        g = Gather(input="speech", action="/gather", method="POST", timeout=7)
+        g.say("Briefly describe what happened.")
+        vr.append(g)
+        vr.redirect("/gather", method="POST")
+        return str(vr)
+
+    # Step 1: description
+    if sess["step"] == 1:
+        if text:
+            sess["answers"]["description"] = text
+            sess["step"] = 2
+        g = Gather(input="speech", action="/gather", method="POST", timeout=7)
+        g.say("How many people need help? Say a number.")
+        vr.append(g)
+        vr.redirect("/gather", method="POST")
+        return str(vr)
+
+    # Step 2: people
+    if sess["step"] == 2:
+        if text:
+            sess["answers"]["people"] = _extract_int_from_speech(text, 1)
+            sess["step"] = 3
+        g = Gather(input="speech", action="/gather", method="POST", timeout=7)
+        g.say("Is anyone in immediate danger? Please say yes or no.")
+        vr.append(g)
+        vr.redirect("/gather", method="POST")
+        return str(vr)
+
+    # Step 3: immediate danger -> finalize
+    if sess["step"] == 3:
+        danger = (text.lower() if text else "")
+        sess["answers"]["danger"] = "yes" in danger
+        sess["step"] = 4  # done
+
+        # Build one transcript string for the model
+        transcript = (
+            f"Location: {sess['answers'].get('location','unknown')}. "
+            f"Description: {sess['answers'].get('description','')}. "
+            f"People: {sess['answers'].get('people',1)}. "
+            f"Immediate danger: {'yes' if sess['answers'].get('danger') else 'no'}."
+        )
+
         result = summarize_with_bedrock(transcript)
         result["id"] = len(INCIDENTS) + 1
+        # Patch with explicit answers if model missed something
+        result.setdefault("location", sess["answers"].get("location", "unknown"))
+        result.setdefault("people_involved", sess["answers"].get("people", 1))
+        if "severity" not in result:
+            result["severity"] = "high" if sess["answers"].get("danger") else "medium"
         INCIDENTS.append(result)
 
-    from twilio.twiml.voice_response import VoiceResponse
-    vr = VoiceResponse()
-    vr.say("Thank you. We have captured your information.")
-    vr.hangup()
+        vr.say("Thank you. We have your location and details. Help is being dispatched now.")
+        vr.hangup()
+
+        CALLS.pop(CallSid, None)  # cleanup
+        return str(vr)
+
+    # Fallback
+    vr.say("Sorry, I didn't catch that.")
+    vr.redirect("/voice", method="POST")
     return str(vr)
